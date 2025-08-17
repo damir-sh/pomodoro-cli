@@ -1,6 +1,8 @@
-// Import necessary crates for command-line parsing, I/O operations, threading, and time handling
+// Import necessary crates for command-line parsing, I/O operations, threading, time handling, and signal handling
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,15 +55,41 @@ fn fmt_mm_ss(total_secs: u64) -> String {
     format!("{m}:{s:02}") // Format with zero-padded seconds (e.g., "5:03" not "5:3")
 }
 
-// Main countdown function that displays a real-time timer
-// This function creates a visual countdown that updates every second
-// It uses precise timing to avoid drift over long periods
-fn countdown_secs(secs: u64, label: &str) {
+// Setup signal handler for graceful cancellation with Ctrl+C
+// This function creates a shared atomic boolean that gets set to true when SIGINT is received
+// Returns an Arc<AtomicBool> that can be checked in loops to detect cancellation requests
+fn setup_signal_handler() -> Arc<AtomicBool> {
+    let cancelled = Arc::new(AtomicBool::new(false)); // Create shared cancellation flag
+    let cancelled_clone = Arc::clone(&cancelled); // Clone for the signal handler closure
+
+    // Register signal handler for SIGINT (Ctrl+C)
+    // This uses a closure that captures the cloned atomic boolean
+    ctrlc::set_handler(move || {
+        cancelled_clone.store(true, Ordering::SeqCst); // Set cancellation flag atomically
+        println!("\n\n⏹️  Cancelled by user. Goodbye!"); // Inform user of cancellation
+        std::process::exit(0); // Exit immediately on Ctrl+C for clean termination
+    })
+    .expect("Error setting Ctrl+C handler"); // Panic if we can't set up signal handling
+
+    cancelled // Return the cancellation flag for use in countdown loops
+}
+
+// Main countdown function that displays a real-time timer with cancellation support
+// This function creates a visual countdown that updates every second and can be cancelled with Ctrl+C
+// It uses precise timing to avoid drift over long periods and respects cancellation requests
+fn countdown_secs(secs: u64, label: &str, cancelled: &Arc<AtomicBool>) -> bool {
     let start: Instant = Instant::now(); // Record the exact moment we started counting
     let mut tick: u64 = 0u64; // Track how many seconds have elapsed since start
 
-    // Main countdown loop - runs once per second until time expires
+    // Main countdown loop - runs once per second until time expires or cancellation
     loop {
+        // Check for cancellation request before each iteration
+        // This ensures responsive cancellation even during long countdowns
+        if cancelled.load(Ordering::SeqCst) {
+            println!("\n⏹️  Timer cancelled"); // Inform user that timer was cancelled
+            return false; // Return false to indicate cancellation occurred
+        }
+
         // Calculate how many seconds remain at this tick
         // saturating_sub prevents underflow if tick somehow exceeds secs
         let remaining = secs.saturating_sub(tick);
@@ -69,13 +97,13 @@ fn countdown_secs(secs: u64, label: &str) {
         // Render the current countdown state
         // \r (carriage return) moves cursor to start of line, overwriting previous output
         // This creates the effect of a timer that updates in place rather than scrolling
-        print!("\r{label}: {}", fmt_mm_ss(remaining));
+        print!("\r{label}: {} (Ctrl+C to cancel)", fmt_mm_ss(remaining));
         io::stdout().flush().ok(); // Force output to display immediately (stdout is buffered)
 
         // Check if countdown is complete
         if remaining == 0 {
             println!(); // Add newline after finishing countdown to move to next line
-            break; // Exit the countdown loop
+            return true; // Return true to indicate successful completion
         }
 
         // Schedule next tick exactly 1 second from start + current tick count
@@ -97,8 +125,12 @@ fn countdown_secs(secs: u64, label: &str) {
 }
 
 // Main entry point of the application
-// This function orchestrates the entire Pomodoro session based on user input
+// This function orchestrates the entire Pomodoro session based on user input with cancellation support
 fn main() {
+    // Setup signal handler for graceful cancellation
+    // This must be done early to ensure Ctrl+C works throughout the entire session
+    let cancelled = setup_signal_handler();
+
     // Parse command-line arguments using clap
     // This will automatically handle --help, --version, and argument validation
     let cli: Cli = Cli::parse();
@@ -116,6 +148,7 @@ fn main() {
             // Display the configuration for this pomodoro session
             // This helps users confirm they've set the right parameters
             println!("Run with focus={focus}m, break-min={break_min}m, cycles={cycles}");
+            println!("Press Ctrl+C at any time to cancel the session");
 
             // Convert minutes to seconds for the countdown functions
             // All our timing functions work in seconds for precision
@@ -129,7 +162,10 @@ fn main() {
 
                 // Focus period - the main work time
                 // This is when the user should focus on their task without distractions
-                countdown_secs(focus_secs, "Focus");
+                // If countdown returns false, it means the user cancelled, so we exit
+                if !countdown_secs(focus_secs, "Focus", &cancelled) {
+                    return; // Exit main function if focus period was cancelled
+                }
                 println!("✅ Focus done"); // Celebrate completion of focus time
 
                 // Break period (skip break after the last session)
@@ -150,7 +186,10 @@ fn main() {
                     let label = if is_long { "Long break" } else { "Break" };
 
                     // Run the break countdown with appropriate duration and label
-                    countdown_secs(break_secs, label);
+                    // If countdown returns false, it means the user cancelled, so we exit
+                    if !countdown_secs(break_secs, label, &cancelled) {
+                        return; // Exit main function if break period was cancelled
+                    }
                     println!("☕ {label} over"); // Signal that break time is finished
                 }
             }
